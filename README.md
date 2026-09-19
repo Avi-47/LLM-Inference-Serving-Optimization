@@ -396,10 +396,6 @@ output = list(
 
 # Architecture
 
-## Architecture
-
-## Architecture
-
 <!-- ![architecture_diagram](assets/architecture_diagram.png) -->
 
 ```mermaid
