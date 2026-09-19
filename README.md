@@ -396,6 +396,9 @@ output = list(
 
 ## Architecture
 
+## Architecture
+
+```mermaid
 flowchart TD
     A[Client] --> B[FastAPI /generate]
     B --> C[Request Manager]
@@ -412,12 +415,13 @@ flowchart TD
     H --> I
 
     I --> J[Speculative Decoding]
-    J --> K[Draft Model<br/>0.5B]
-    K --> L[Target Model<br/>1.5B]
-    L --> M[Accepted / Corrected Tokens]
+    J --> K[Draft Model 0.5B]
+    K --> L[Target Model 1.5B]
+    L --> M[Accepted or Corrected Tokens]
 
     M --> N[SSE Stream]
     N --> O[Client]
+```     
 
 ```mermaid
 flowchart TD
