@@ -400,7 +400,7 @@ output = list(
 
 ## Architecture
 
-![Architecture](assets/architecture diagram.png)
+![architecture_diagram](assets/architecture_diagram.png)
 
 ```mermaid
 flowchart TD
