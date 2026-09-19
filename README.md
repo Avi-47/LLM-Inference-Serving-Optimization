@@ -241,7 +241,7 @@ The final experimental pipeline combines the two ideas:
 
 ![pipeline diagram](assets/diagram_1.png)
 
-```text
+<!-- ```text
                  Incoming request
                         │
                         ▼
@@ -263,7 +263,7 @@ The final experimental pipeline combines the two ideas:
                 └──────┬──────┘
                        ▼
                   SSE stream
-```
+``` -->
 
 This gives the project a useful progression:
 
@@ -400,7 +400,7 @@ output = list(
 
 ## Architecture
 
-![architecture_diagram](assets/architecture_diagram.png)
+<!-- ![architecture_diagram](assets/architecture_diagram.png) -->
 
 ```mermaid
 flowchart TD
