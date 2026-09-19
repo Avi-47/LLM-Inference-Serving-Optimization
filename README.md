@@ -1,58 +1,423 @@
-Lightweight LLM Serving & Inference Optimization
+Mini LLM Serving Lab
 
-An experimental LLM inference stack focused on improving response time and serving efficiency under concurrent workloads.
+A from-scratch exploration of LLM inference serving using Qwen2.5, with an emphasis on understanding what happens between a user request and token generation.
 
-The project implements a small inference server around Qwen2.5 and explores several techniques commonly used to improve autoregressive generation: request scheduling, KV-cache reuse, and speculative decoding. The different approaches are benchmarked against a simple baseline server to measure their impact on throughput and latency.
+Instead of relying completely on a high-level generation API, this project implements the decoding loop, KV-cache management, request scheduling, prefix reuse, and speculative decoding explicitly. The resulting components are exposed through lightweight FastAPI servers and evaluated under concurrent workloads.
 
-Project Overview
+The project is primarily an inference-engine learning and experimentation project rather than a production-ready serving framework.
 
-The goal of this project is to understand what happens inside an LLM serving system rather than relying entirely on high-level inference frameworks.
+What this project explores
 
-The implementation includes:
+The implementation builds the serving stack incrementally:
 
-A custom autoregressive generation loop with explicit KV-cache handling
+Client Requests
+FastAPI Server
+Serving Strategy
+Baseline Generator
+Round-Robin Scheduler
+Optimized Pipeline
+Request Queue
+Capacity-Limited Active Requests
+One Decode Step per Request
+Prefix Cache
+Speculative Decoder
+Reuse Shared KV Cache
+Draft Model
+Candidate Tokens
+Target Model Verification
+Token Stream
+Client
 
-Round-robin scheduling for multiple simultaneous requests
+The main ideas implemented in the repository are:
 
-Shared-prefix detection and automatic KV-cache reuse
+Manual autoregressive decoding with past_key_values
 
-Speculative generation using a smaller draft model
+Explicit KV-cache management
 
-A load-testing setup for evaluating concurrent requests
+Round-robin scheduling across active requests
 
-Latency and throughput measurements across different concurrency levels
+Capacity-limited admission of requests
 
-A note about batching
+Reuse of shared prompt prefixes
 
-Some parts of the project use the term continuous batching. Here, that terminology refers to the scheduler's iteration-level admission of requests rather than true GPU-side batched execution.
+Speculative decoding with a smaller draft model
 
-The implementation does not combine multiple independent requests into a single batched model forward pass as a production inference engine such as vLLM would.
+Streaming token responses using Server-Sent Events
 
-Performance Evaluation
+Concurrent load testing and latency/throughput measurement
 
-The optimized pipeline was compared with a straightforward single-request baseline under increasing concurrent load.
+Models
+
+The experiments use two Qwen2.5 instruction-tuned models:
+
+Role	Model
+Target model	Qwen/Qwen2.5-1.5B-Instruct
+Draft model	Qwen/Qwen2.5-0.5B-Instruct
+
+The target model is responsible for producing the final generation. The smaller model is used only for speculative token proposals.
+
+Both models are loaded in FP16 and placed on CUDA:
+
+target_model = AutoModelForCausalLM.from_pretrained(
+    target_name,
+    torch_dtype=torch.float16,
+    device_map="cuda"
+)
+
+draft_model = AutoModelForCausalLM.from_pretrained(
+    draft_name,
+    torch_dtype=torch.float16,
+    device_map="cuda"
+)
+
+1. Manual KV-Cache Decoding
+
+The first stage replaces the normal model.generate() path with an explicit decoding loop.
+
+During the initial prompt pass, the model produces a KV cache:
+
+out = model(input_ids, use_cache=True)
+past_key_values = out.past_key_values
+
+
+For subsequent tokens, only the newly generated token is passed back to the model:
+
+out = model(
+    input_ids=next_token,
+    past_key_values=past_key_values,
+    use_cache=True
+)
+
+
+This avoids recomputing the complete prompt and generated sequence on every decoding step.
+
+The basic flow is:
+
+Prompt
+Tokenize
+Initial Forward Pass
+KV Cache
+Next Token
+Feed One Token
+Updated KV Cache
+Next Token
+
+The implementation uses greedy decoding, selecting the token with the highest logit at each step.
+
+2. Streaming Inference Server
+
+The manual generator is exposed through FastAPI.
+
+Each generated token is decoded and returned through a streaming response:
+
+Client
+  │
+  │ POST /generate
+  ▼
+FastAPI
+  │
+  ▼
+Generator
+  │
+  ├── token 1 ──► client
+  ├── token 2 ──► client
+  ├── token 3 ──► client
+  └── ...
+
+
+The response uses:
+
+text/event-stream
+
+
+so that the client can observe tokens as they are generated rather than waiting for the entire response.
+
+3. Round-Robin Request Scheduling
+
+The baseline server generates each request independently.
+
+The next version introduces a request manager that maintains:
+
+a waiting queue
+
+a collection of active requests
+
+a maximum number of simultaneously active requests
+
+flowchart TD
+    A[Incoming Requests] --> B[Waiting Queue]
+
+    B --> C{Capacity Available?}
+
+    C -- Yes --> D[Admit Request]
+    C -- No --> B
+
+    D --> E[Active Requests]
+
+    E --> F[Request 1]
+    E --> G[Request 2]
+    E --> H[Request 3]
+    E --> I[Request N]
+
+    F --> J[One Token]
+    G --> K[One Token]
+    H --> L[One Token]
+    I --> M[One Token]
+
+    J --> E
+    K --> E
+    L --> E
+    M --> E
+
+
+The scheduler repeatedly calls next() on each active generator.
+
+Conceptually:
+
+Request A → token
+Request B → token
+Request C → token
+Request A → token
+Request B → token
+Request C → token
+...
+
+
+This prevents one long generation from occupying the server's entire execution loop while other requests wait.
+
+Important terminology
+
+This project uses the phrase iteration-level scheduling rather than claiming production-grade continuous batching.
+
+The scheduler interleaves independent generation streams. It does not construct a GPU batch containing multiple unrelated user requests for every decoding step.
+
+That distinction matters when comparing this implementation with production inference engines.
+
+4. Prefix KV-Cache Reuse
+
+Many real workloads contain prompts with a common beginning.
+
+For example:
+
+"You are a helpful assistant. Answer concisely: What is the capital of France?"
+
+"You are a helpful assistant. Answer concisely: What is the capital of Japan?"
+
+"You are a helpful assistant. Answer concisely: What is the capital of Germany?"
+
+
+The initial portion is identical.
+
+Instead of recomputing that shared prefix for every request, this project searches for a matching token prefix and stores its KV cache.
+
+flowchart TD
+    A[Incoming Prompt] --> B[Tokenize Prompt]
+
+    B --> C{Cached Prefix?}
+
+    C -- Yes --> D[Retrieve KV Cache]
+    C -- No --> E[Compare with Other Waiting Prompts]
+
+    E --> F{Shared Prefix Found?}
+
+    F -- Yes --> G[Compute Shared Prefix Once]
+    G --> H[Store KV Cache]
+    H --> D
+
+    F -- No --> I[Normal Prefill]
+
+    D --> J[Process Remaining Suffix]
+    I --> J
+
+    J --> K[Autoregressive Generation]
+
+
+The implementation searches for the longest cached prefix that matches the beginning of the current token sequence.
+
+The cached state contains the model's past_key_values, allowing the suffix to be processed without recomputing the cached portion.
+
+The code also checks that the optimized generation produces the same token sequence as the ordinary decoding path for the test prompts.
+
+5. Speculative Decoding
+
+The project also implements speculative decoding using two models.
+
+Draft model
+    │
+    ├── proposes token 1
+    ├── proposes token 2
+    ├── proposes token 3
+    └── proposes token 4
+             │
+             ▼
+       Target model
+             │
+             ├── verifies proposal 1
+             ├── verifies proposal 2
+             ├── verifies proposal 3
+             └── verifies proposal 4
+
+
+The smaller Qwen2.5-0.5B-Instruct model proposes several tokens.
+
+The larger Qwen2.5-1.5B-Instruct model then evaluates the proposed sequence in a single forward call and determines which proposed tokens can be accepted.
+
+If a proposed token disagrees with the target model's greedy prediction, the target prediction is used as the correction.
+
+The target KV cache is then truncated to the appropriate accepted prefix before generation continues.
+
+Why speculative decoding can help
+
+Ordinary decoding generally requires a target-model forward pass for each newly generated token.
+
+Speculative decoding attempts to generate several tokens from the inexpensive draft model and have the target model verify them together.
+
+If multiple draft tokens are accepted, more than one output token can be produced from a target-model verification step.
+
+The important metric here is therefore not simply the draft model's speed, but:
+
+accepted output tokens
+───────────────────────
+target-model calls
+
+
+The experiment records this as tokens per target forward pass.
+
+6. Combining the Optimizations
+
+The final server combines:
+
+Request scheduling
+
+Prefix KV-cache reuse
+
+Speculative decoding
+
+The high-level execution path becomes:
+
+flowchart TD
+    A[Incoming Request] --> B[Request Queue]
+
+    B --> C[Round-Robin Scheduler]
+
+    C --> D[Tokenize Prompt]
+
+    D --> E{Shared Prefix Available?}
+
+    E -- Yes --> F[Reuse Cached Target + Draft KV]
+    E -- No --> G[Normal Prompt Prefill]
+
+    F --> H[Current Target/Draft State]
+    G --> H
+
+    H --> I[Draft Model]
+
+    I --> J[Propose K Tokens]
+
+    J --> K[Target Model Verification]
+
+    K --> L{Draft Tokens Accepted?}
+
+    L -- Yes --> M[Emit Accepted Tokens]
+    L -- Partial --> N[Use Target Correction]
+    L -- No --> N
+
+    N --> M
+    M --> O{Generation Complete?}
+
+    O -- No --> C
+    O -- Yes --> P[Finish Request]
+
+
+This allows the project to study how multiple inference optimizations interact rather than evaluating each technique completely in isolation.
+
+Benchmarking
+
+A concurrent load-testing client is included using httpx and asyncio.
+
+The test client records:
+
+TTFT — time to first token
+
+Total latency — request start to completion
+
+Per-request token rate
+
+Aggregate throughput
+
+The code also calculates percentile measurements such as p50, p95, and p99 for TTFT and latency.
+
+Metrics
+
+TTFT
+
+time of first generated token
+──────────────────────────────
+request start time
+
+
+Total latency
+
+request completion time - request start time
+
+
+Aggregate throughput
+
+total generated tokens
+──────────────────────
+wall-clock test duration
+
+
+These measurements are useful because optimizing average token generation speed alone does not necessarily improve the experience of concurrent users.
+
+Experimental Results
+
+The following measurements were obtained from the project's benchmark runs:
 
 Concurrent Requests	Baseline Throughput	Optimized Throughput	Baseline Latency	Optimized Latency
 5	12.1 tok/s	17.6 tok/s	8.3 s	5.7 s
 10	9.8 tok/s	17.9 tok/s	20.4 s	9.0 s
 20	10.3 tok/s	18.2 tok/s	38.8 s	18.0 s
 
-Across these experiments, combining the serving optimizations resulted in approximately 1.8× higher throughput and substantially lower latency under concurrent workloads.
+Across these recorded runs, the combined configuration achieved approximately:
 
-These numbers are environment-dependent and should be treated as measurements from the experiment rather than general production benchmarks.
+1.8× the measured aggregate throughput
 
-Speculative Decoding
+2.2× lower measured latency
 
-The repository also evaluates how the size of the speculative draft window affects generation efficiency.
+These are experiment-specific measurements, not universal performance guarantees. Results can change with GPU model, CUDA/PyTorch versions, prompt distribution, sequence length, concurrency, and model configuration.
 
-With a draft window of k=8, the experiment reaches approximately 4.55 generated tokens per target-model forward pass, compared with one token per target forward pass for conventional autoregressive decoding.
+Speculative Decoding Experiment
 
-The experiment illustrates the main idea behind speculative decoding: use a smaller model to propose several tokens and let the larger target model verify those proposals together.
+The repository also contains a draft-window sweep.
 
-Components
+The measured values used for the experiment are:
 
-The implementation is organized into separate modules so that each optimization can be examined independently.
+Draft window k	Tokens / target forward pass	Aggregate throughput
+1	1.79	17.5 tok/s
+2	2.62	19.0 tok/s
+4	3.42	18.3 tok/s
+8	4.55	15.8 tok/s
 
+This demonstrates an important trade-off.
+
+Increasing k can increase the number of accepted tokens per target verification call, but a larger speculative window does not automatically mean higher end-to-end throughput.
+
+For this experiment, the highest measured tokens-per-target-forward-pass value occurs at k=8, while the highest measured aggregate throughput occurs at a smaller draft window.
+
+That distinction is useful when discussing speculative decoding: verification efficiency and overall serving throughput are related, but they are not the same metric.
+
+Speculative Decoding Plot
+
+The plot compares the speculative window against both:
+
+tokens generated per target-model forward pass
+
+aggregate throughput
+
+The horizontal reference at 1.0 represents the conventional one-token-per-target-step baseline.
+
+Repository Layout
 .
 ├── inference (6).ipynb
 ├── all_in_one.py
@@ -69,102 +434,124 @@ The implementation is organized into separate modules so that each optimization 
 └── assets/
     └── draft_k_sweep.png
 
-Source modules
-
-model_setup.py
-Handles model and tokenizer initialization.
-
-decode.py
-Contains the manually implemented autoregressive decoding logic and KV-cache management.
-
-scheduler.py
-Implements the round-robin request scheduler and capacity-controlled request admission.
-
-prefix_caching.py
-Finds reusable prompt prefixes and avoids recomputing their KV representations.
-
-speculative_decoding.py
-Implements the draft-and-verify generation procedure.
-
-combined_pipeline.py
-Combines prefix caching with speculative decoding.
-
-servers.py
-Contains the FastAPI server implementations used for the different serving configurations.
-
-load_testing.py
-Provides the concurrent workload generator and collects serving metrics.
-
-plotting.py
-Generates plots used for analyzing the benchmark results.
-
-Running the Experiments
-
-The main experiment is available as a Jupyter notebook:
-
 inference (6).ipynb
 
+The notebook containing the end-to-end experiments.
 
-The notebook was originally executed in a GPU environment using two NVIDIA T4 GPUs.
-
-For users who prefer a single Python file, the complete implementation is also available in:
+The original experiment environment used Kaggle with 2× NVIDIA T4 GPUs.
 
 all_in_one.py
 
-What This Project Demonstrates
+A consolidated version of the implementation.
 
-Rather than treating LLM inference as a single model call, this project breaks serving into several independent optimization problems:
+src/model_setup.py
 
-Scheduling — deciding which request should make progress next.
+Model and tokenizer initialization.
 
-Caching — avoiding repeated computation for identical prompt prefixes.
+src/decode.py
 
-Generation efficiency — reducing the number of expensive target-model forward passes.
+Manual autoregressive decoding and KV-cache handling.
 
-Concurrency — understanding how serving behavior changes as the number of simultaneous requests increases.
+src/scheduler.py
 
-Measurement — evaluating changes using throughput and latency rather than relying only on theoretical improvements.
+Request management, waiting queues, active requests, and round-robin stepping.
 
-This makes the repository useful as a small-scale exploration of the mechanisms behind modern LLM inference serving.
+src/prefix_caching.py
+
+Shared-prefix detection and KV-cache reuse.
+
+src/speculative_decoding.py
+
+Draft-and-verify speculative generation.
+
+src/combined_pipeline.py
+
+Combines prefix caching and speculative decoding.
+
+src/servers.py
+
+FastAPI server implementations.
+
+src/load_testing.py
+
+Concurrent request generation and benchmark metric collection.
+
+src/plotting.py
+
+Benchmark visualization.
+
+Running the Project
+
+Install the main dependencies:
+
+pip install torch transformers accelerate
+
+
+For the server and load-testing components:
+
+pip install fastapi uvicorn httpx
+
+
+Additional analysis/plotting dependencies:
+
+pip install pandas matplotlib
+
+
+The notebook can then be executed in a CUDA-enabled environment with sufficient GPU memory.
 
 Limitations
 
-This is an educational/experimental inference implementation rather than a production serving framework.
+This implementation intentionally keeps the serving stack small enough to inspect and understand.
 
-In particular:
+It should not be interpreted as a replacement for production inference engines.
 
-GPU execution is not optimized to the level of mature inference engines.
+Some important limitations are:
 
-The scheduler does not provide true production-grade continuous batching.
+Request scheduling is implemented in Python and does not provide true multi-request GPU batching.
 
-Benchmark results depend heavily on the hardware and model configuration.
+The prefix cache is a simple in-memory structure rather than a production cache manager.
 
-Memory management and fault tolerance are intentionally simplified.
+KV-cache copying and management are intentionally straightforward.
 
-The implementation is designed primarily for understanding and experimentation.
+The speculative decoder uses greedy decoding and a fixed draft-model strategy.
 
-Experiments to Try
+The benchmark uses relatively short generations.
 
-Some useful directions for extending the project include:
+Hardware utilization is not optimized to the level of specialized inference systems.
 
-Testing additional concurrency levels
+The benchmark values depend on the specific execution environment.
 
-Comparing different draft models
+The project is therefore best viewed as an educational implementation for studying inference-serving techniques.
 
-Sweeping speculative decoding window sizes
+Key Takeaways
 
-Measuring TTFT separately from end-to-end latency
+This project demonstrates several layers of an LLM serving system:
 
-Testing different prompt-prefix sharing patterns
+                 LLM Serving
+                      │
+       ┌──────────────┼──────────────┐
+       │              │              │
+   Decoding       Scheduling      Caching
+       │              │              │
+   KV Cache       Round Robin    Prefix Reuse
+       │
+       ▼
+ Speculative Decoding
+       │
+       ▼
+ Draft Model → Target Verification
+       │
+       ▼
+ Concurrent Serving
+       │
+       ▼
+ TTFT / Latency / Throughput
 
-Comparing against established inference engines
 
-Investigating actual batched GPU execution
+The main objective is not simply to make a model generate text, but to understand how model execution, cache reuse, scheduling, and concurrent request handling interact inside an inference server.
 
-Profiling GPU utilization and memory consumption
+Attribution
 
-License & Attribution
+If this repository contains code, experiments, diagrams, or other material adapted from another project, retain the original project's license and attribution requirements.
 
-If portions of this implementation were adapted from another repository, notebook, or codebase, retain the original project's license and attribution requirements here.
-
-Add the original source and any required attribution before publishing a derivative version.
+This README describes the implementation and experiments represented in the current repository.
