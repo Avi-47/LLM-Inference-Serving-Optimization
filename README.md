@@ -396,6 +396,29 @@ output = list(
 
 ## Architecture
 
+flowchart TD
+    A[Client] --> B[FastAPI /generate]
+    B --> C[Request Manager]
+
+    C --> D[Waiting Queue]
+    C --> E[Round-Robin Scheduler]
+
+    E --> F{Prefix Cache Hit?}
+
+    F -->|Yes| G[Reuse KV Cache]
+    F -->|No| H[Normal Prefill]
+
+    G --> I[Inference State]
+    H --> I
+
+    I --> J[Speculative Decoding]
+    J --> K[Draft Model<br/>0.5B]
+    K --> L[Target Model<br/>1.5B]
+    L --> M[Accepted / Corrected Tokens]
+
+    M --> N[SSE Stream]
+    N --> O[Client]
+
 ```mermaid
 flowchart TD
     A[Client] --> B[FastAPI /generate]
