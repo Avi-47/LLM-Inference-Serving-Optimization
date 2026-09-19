@@ -239,6 +239,8 @@ This makes it possible to investigate how the draft window `k` affects performan
 
 The final experimental pipeline combines the two ideas:
 
+![pipeline diagram](assets/diagram_1.png)
+
 ```text
                  Incoming request
                         │
@@ -397,6 +399,8 @@ output = list(
 ## Architecture
 
 ## Architecture
+
+![Architecture](assets/architecture diagram.png)
 
 ```mermaid
 flowchart TD
