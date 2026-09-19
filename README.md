@@ -197,6 +197,8 @@ The implementation also attempts to discover useful prefixes among waiting reque
 
 # 5. Speculative decoding
 
+![draft k sweep](assets/draft_k_sweep.png)
+
 The project also experiments with **speculative decoding** using two models:
 
 ```text
