@@ -1,5 +1,9 @@
 # pip install -q transformers accelerate
 
+import gc
+import threading
+from collections import OrderedDict
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 target_name = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -333,7 +337,118 @@ async def check_interleave():
 import copy
 
 MIN_SHARED_PREFIX_LEN = 3
-prefix_cache_pool = {}
+MODEL_CACHE_VERSION = "qwen2.5-1.5b_target_v1"
+DRAFT_CACHE_VERSION = "qwen2.5-0.5b_draft_v1"
+MAX_PREFIX_CACHE_ENTRIES = 128
+
+
+class PrefixCache:
+    """Bounded, version-aware cache for immutable prefix snapshots."""
+
+    def __init__(self, max_entries=MAX_PREFIX_CACHE_ENTRIES):
+        self.max_entries = max_entries
+        self._entries = OrderedDict()
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def __len__(self):
+        with self._lock:
+            return len(self._entries)
+
+    def __contains__(self, prefix_ids):
+        with self._lock:
+            return tuple(prefix_ids) in self._entries
+
+    def __getitem__(self, prefix_ids):
+        with self._lock:
+            key = tuple(prefix_ids)
+            entry = self._entries[key]
+            self._entries.move_to_end(key)
+            return entry
+
+    def __setitem__(self, prefix_ids, entry):
+        self.put(prefix_ids, entry)
+
+    def items(self):
+        with self._lock:
+            return list(self._entries.items())
+
+    def clear(self):
+        self.invalidate_prefix_cache(clear=True)
+
+    def get(self, prefix_ids, default=None, *, target_version=None, draft_version=None):
+        key = tuple(prefix_ids)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return default
+            if (target_version is not None and entry.get("target_version") != target_version) or \
+                    (draft_version is not None and entry.get("draft_version") != draft_version):
+                self._remove_locked(key)
+                self.misses += 1
+                return default
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry
+
+    def metrics(self):
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "cache_hits": self.hits,
+                "cache_misses": self.misses,
+                "cache_hit_rate": self.hits / total if total else 0.0,
+                "evictions": self.evictions,
+                "entries": len(self._entries),
+            }
+
+    def reset_metrics(self):
+        with self._lock:
+            self.hits = 0
+            self.misses = 0
+            self.evictions = 0
+
+    def put(self, prefix_ids, entry):
+        key = tuple(prefix_ids)
+        with self._lock:
+            old_entry = self._entries.pop(key, None)
+            del old_entry
+            self._entries[key] = entry
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                _, evicted = self._entries.popitem(last=False)
+                del evicted
+                self.evictions += 1
+        gc.collect()
+
+    def _remove_locked(self, key):
+        entry = self._entries.pop(key, None)
+        del entry
+
+    def invalidate_prefix_cache(self, prefix_ids=None, target_version=None,
+                                draft_version=None, clear=False):
+        with self._lock:
+            if clear:
+                removed = list(self._entries.values())
+                self._entries.clear()
+            elif prefix_ids is not None:
+                key = tuple(prefix_ids)
+                removed = [self._entries.pop(key)] if key in self._entries else []
+            else:
+                removed = []
+                for key, entry in list(self._entries.items()):
+                    if ((target_version is None or entry.get("target_version") == target_version) and
+                            (draft_version is None or entry.get("draft_version") == draft_version)):
+                        removed.append(self._entries.pop(key))
+        del removed
+        gc.collect()
+
+
+prefix_cache = PrefixCache()
+prefix_cache_pool = prefix_cache
 
 
 def shared_prefix_len(tokens_a, tokens_b):
@@ -345,11 +460,14 @@ def shared_prefix_len(tokens_a, tokens_b):
     return length
 
 
-def find_cached_prefix(token_ids):
+def find_cached_prefix(token_ids, target_version=MODEL_CACHE_VERSION,
+                       draft_version=None):
     best = None
-    for cached_ids in prefix_cache_pool:
+    for cached_ids, _ in prefix_cache_pool.items():
         n = len(cached_ids)
-        if len(token_ids) >= n and tuple(token_ids[:n]) == cached_ids:
+        if (len(token_ids) >= n and tuple(token_ids[:n]) == cached_ids and
+                prefix_cache_pool.get(cached_ids, target_version=target_version,
+                                      draft_version=draft_version) is not None):
             if best is None or n > len(best):
                 best = cached_ids
     return best
@@ -362,8 +480,54 @@ def cache_prefix(model, tokenizer, token_ids):
     next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     prefix_cache_pool[tuple(token_ids)] = {
         "kv": out.past_key_values,
-        "first_token": next_token
+        "first_token": next_token,
+        "target_version": MODEL_CACHE_VERSION,
     }
+
+
+def invalidate_prefix_cache(prefix_ids=None, target_version=None, draft_version=None,
+                            clear=False):
+    """Remove one prefix, entries matching versions, or the complete cache."""
+    prefix_cache.invalidate_prefix_cache(prefix_ids, target_version, draft_version, clear)
+
+
+def benchmark_modes(prompts, generate_without_cache, generate_with_cache,
+                    generate_with_validated_cache, iterations=1,
+                    validated_cache_metrics=None):
+    """Measure supplied generators; no performance results are fabricated."""
+    results = {}
+    for name, generator in (
+            ("no_prefix_cache", generate_without_cache),
+            ("prefix_cache", generate_with_cache),
+            ("prefix_cache_lru_version_validation", generate_with_validated_cache)):
+        latencies = []
+        first_token_latencies = []
+        token_count = 0
+        started = time.perf_counter()
+        for _ in range(iterations):
+            for prompt in prompts:
+                request_started = time.perf_counter()
+                token_iterator = iter(generator(prompt))
+                try:
+                    next(token_iterator)
+                except StopIteration:
+                    tokens = []
+                else:
+                    first_token_latencies.append(time.perf_counter() - request_started)
+                    tokens = [None] + list(token_iterator)
+                if not tokens:
+                    first_token_latencies.append(time.perf_counter() - request_started)
+                token_count += len(tokens)
+                latencies.append(time.perf_counter() - request_started)
+        elapsed = time.perf_counter() - started
+        results[name] = {
+            "ttft_seconds": sum(first_token_latencies) / len(first_token_latencies),
+            "total_latency_seconds": sum(latencies) / len(latencies),
+            "aggregate_throughput_tokens_per_second": token_count / elapsed if elapsed else 0.0,
+        }
+    if validated_cache_metrics is not None:
+        results["prefix_cache_lru_version_validation"].update(validated_cache_metrics())
+    return results
 
 
 def generate_tokens_with_prefix_ids(model, tokenizer, cached_entry, suffix_ids, max_tokens=20):
@@ -404,9 +568,14 @@ def resolve_prompt(model, tokenizer, prompt, waiting_prompts, max_tokens=20):
                 break
     if matched_prefix:
         suffix_ids = token_ids[len(matched_prefix):]
-        cached_entry = prefix_cache_pool[matched_prefix]
-        return generate_tokens_with_prefix_ids(model, tokenizer, cached_entry, suffix_ids, max_tokens)
-    else:
+        cached_entry = prefix_cache_pool.get(
+            matched_prefix,
+            target_version=MODEL_CACHE_VERSION,
+        )
+        if cached_entry is not None:
+            return generate_tokens_with_prefix_ids(model, tokenizer, cached_entry, suffix_ids, max_tokens)
+        matched_prefix = None
+    if matched_prefix is None:
         return generate_tokens(model, tokenizer, prompt, max_tokens)
 
 
@@ -475,7 +644,7 @@ def speculative_round(target_model, draft_model, tokenizer, target_kv, draft_kv,
     else:
         new_last_token = torch.argmax(target_logits[:, k, :], dim=-1, keepdim=True)
         with torch.no_grad():
-            extra = draft_model(input_ids=draft_tokens[k - 1], past_key_values=current_draft_kv, use_cache=True)
+            extra = draft_model(input_ids=current_input, past_key_values=current_draft_kv, use_cache=True)
         draft_kv = extra.past_key_values
 
     accepted_tokens = [t.item() for t in draft_tokens[:accept_len]] + [new_last_token.item()]
@@ -539,7 +708,9 @@ def cache_prefix_both(target_model, draft_model, tokenizer, token_ids):
     prefix_cache_pool[tuple(token_ids)] = {
         "target_kv": target_out.past_key_values,
         "draft_kv": draft_out.past_key_values,
-        "first_token": first_token
+        "first_token": first_token,
+        "target_version": MODEL_CACHE_VERSION,
+        "draft_version": DRAFT_CACHE_VERSION,
     }
 
 
@@ -570,7 +741,11 @@ def combined_generate(target_model, draft_model, tokenizer, prompt, waiting_prom
     matched_prefix = None
 
     if use_prefix_cache:
-        matched_prefix = find_cached_prefix(token_ids)
+        matched_prefix = find_cached_prefix(
+            token_ids,
+            target_version=MODEL_CACHE_VERSION,
+            draft_version=DRAFT_CACHE_VERSION if use_speculative else None,
+        )
         if matched_prefix is None:
             for other_prompt in waiting_prompts:
                 other_ids = tokenizer(other_prompt)["input_ids"]
@@ -582,9 +757,16 @@ def combined_generate(target_model, draft_model, tokenizer, prompt, waiting_prom
 
     if matched_prefix:
         suffix_ids = token_ids[len(matched_prefix):]
-        cached_entry = prefix_cache_pool[matched_prefix]
-        target_kv, draft_kv, last_token = prefill_suffix_both(target_model, draft_model, tokenizer, cached_entry, suffix_ids)
-    else:
+        cached_entry = prefix_cache_pool.get(
+            matched_prefix,
+            target_version=MODEL_CACHE_VERSION,
+            draft_version=DRAFT_CACHE_VERSION if use_speculative else None,
+        )
+        if cached_entry is None:
+            matched_prefix = None
+        else:
+            target_kv, draft_kv, last_token = prefill_suffix_both(target_model, draft_model, tokenizer, cached_entry, suffix_ids)
+    if matched_prefix is None:
         input_ids = torch.tensor([token_ids]).to("cuda")
         with torch.no_grad():
             target_out = target_model(input_ids, use_cache=True)

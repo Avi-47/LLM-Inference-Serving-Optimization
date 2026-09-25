@@ -8,6 +8,8 @@ Instead of relying entirely on `model.generate()`, this project implements the m
 * asynchronous request scheduling
 * token-level streaming over HTTP
 * shared-prefix KV-cache reuse
+* exact token-ID prefix matching with model-version-aware validation
+* bounded LRU eviction with cache hit, miss, and eviction metrics
 * speculative decoding with a smaller draft model
 * concurrent load testing and latency/throughput measurement
 
@@ -193,6 +195,31 @@ find longest cached prefix
 
 The implementation also attempts to discover useful prefixes among waiting requests.
 
+### Cache lifecycle
+
+Prefix identity is the exact tuple of token IDs. Entries are reusable only when
+their target and, for speculative decoding, draft model cache versions match
+the active versions. A mismatch invalidates the entry and causes a fresh
+prefill. The bounded cache uses LRU eviction (`MAX_PREFIX_CACHE_ENTRIES`) to
+limit retained GPU KV references. LRU is a memory-management mechanism, not a
+correctness mechanism; version validation is what protects correctness.
+
+`invalidate_prefix_cache` can remove one prefix, entries for a version, or the
+entire cache. Eviction and invalidation release Python references and run
+garbage collection. `torch.cuda.empty_cache()` is intentionally not called for
+each eviction: it only returns unused allocator blocks to CUDA and does not
+free live tensors, so repeated calls can add synchronization overhead. It may
+be useful during explicit maintenance or after a large batch of released
+entries when process-level CUDA free memory must be observed.
+
+The cache uses a small re-entrant lock around metadata operations. Model
+forward passes remain outside the lock, so it is compatible with the existing
+asyncio scheduler without serializing inference work through the cache.
+
+This lifecycle remains a prototype/research implementation. It is not
+equivalent to a production inference engine such as vLLM. TTL is not currently
+implemented.
+
 ---
 
 # 5. Speculative decoding
@@ -230,6 +257,10 @@ The implementation tracks:
 * number of accepted tokens
 * accepted tokens per round
 * target-model tokens produced per verification step
+
+The speculative cache state transition also advances the draft KV state with
+the next draft input after a window is fully accepted, keeping the draft and
+target cache positions aligned for the next round.
 
 This makes it possible to investigate how the draft window `k` affects performance.
 
@@ -558,7 +589,9 @@ It currently does **not** provide:
 * optimized CUDA kernels
 * production observability
 
-The prefix cache is also intentionally simple and in-memory.
+The prefix cache remains an in-memory prototype, but now has exact token-ID
+matching, model-version validation, bounded LRU eviction, and hit/miss/eviction
+metrics. It does not provide production-grade GPU memory management.
 
 These limitations are useful because they leave clear directions for extending the project.
 
@@ -570,8 +603,7 @@ Some natural next steps would be:
 
 * implement actual tensor-level dynamic batching
 * add request cancellation and timeouts
-* introduce bounded KV-cache memory
-* implement cache eviction policies such as LRU
+* add TTL or other optional freshness policies
 * compare different draft models
 * benchmark different speculative decoding window sizes
 * add prompt-length and output-length sweeps

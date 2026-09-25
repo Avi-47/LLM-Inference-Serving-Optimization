@@ -48,7 +48,7 @@ def speculative_round(target_model, draft_model, tokenizer, target_kv, draft_kv,
     else:
         new_last_token = torch.argmax(target_logits[:, k, :], dim=-1, keepdim=True)
         with torch.no_grad():
-            extra = draft_model(input_ids=draft_tokens[k - 1], past_key_values=current_draft_kv, use_cache=True)
+            extra = draft_model(input_ids=current_input, past_key_values=current_draft_kv, use_cache=True)
         draft_kv = extra.past_key_values
 
     accepted_tokens = [t.item() for t in draft_tokens[:accept_len]] + [new_last_token.item()]

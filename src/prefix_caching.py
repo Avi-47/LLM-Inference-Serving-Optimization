@@ -1,8 +1,122 @@
 import copy
+import gc
+import threading
+from collections import OrderedDict
+
 import torch
 
 MIN_SHARED_PREFIX_LEN = 3
-prefix_cache_pool = {}
+MODEL_CACHE_VERSION = "qwen2.5-1.5b_target_v1"
+DRAFT_CACHE_VERSION = "qwen2.5-0.5b_draft_v1"
+MAX_PREFIX_CACHE_ENTRIES = 128
+
+
+class PrefixCache:
+    """Bounded, version-aware cache for immutable prefix snapshots."""
+
+    def __init__(self, max_entries=MAX_PREFIX_CACHE_ENTRIES):
+        self.max_entries = max_entries
+        self._entries = OrderedDict()
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def __len__(self):
+        with self._lock:
+            return len(self._entries)
+
+    def __contains__(self, prefix_ids):
+        with self._lock:
+            return tuple(prefix_ids) in self._entries
+
+    def __getitem__(self, prefix_ids):
+        with self._lock:
+            entry = self._entries[tuple(prefix_ids)]
+            self._entries.move_to_end(tuple(prefix_ids))
+            return entry
+
+    def __setitem__(self, prefix_ids, entry):
+        self.put(prefix_ids, entry)
+
+    def items(self):
+        with self._lock:
+            return list(self._entries.items())
+
+    def clear(self):
+        self.invalidate_prefix_cache(clear=True)
+
+    def get(self, prefix_ids, default=None, *, target_version=None, draft_version=None):
+        key = tuple(prefix_ids)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return default
+            if (target_version is not None and entry.get("target_version") != target_version) or \
+                    (draft_version is not None and entry.get("draft_version") != draft_version):
+                self._remove_locked(key)
+                self.misses += 1
+                return default
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry
+
+    def metrics(self):
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "cache_hits": self.hits,
+                "cache_misses": self.misses,
+                "cache_hit_rate": self.hits / total if total else 0.0,
+                "evictions": self.evictions,
+                "entries": len(self._entries),
+            }
+
+    def reset_metrics(self):
+        with self._lock:
+            self.hits = 0
+            self.misses = 0
+            self.evictions = 0
+
+    def put(self, prefix_ids, entry):
+        key = tuple(prefix_ids)
+        with self._lock:
+            old_entry = self._entries.pop(key, None)
+            del old_entry
+            self._entries[key] = entry
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                _, evicted = self._entries.popitem(last=False)
+                del evicted
+                self.evictions += 1
+        gc.collect()
+
+    def _remove_locked(self, key):
+        entry = self._entries.pop(key, None)
+        del entry
+
+    def invalidate_prefix_cache(self, prefix_ids=None, target_version=None,
+                                draft_version=None, clear=False):
+        with self._lock:
+            if clear:
+                removed = list(self._entries.values())
+                self._entries.clear()
+            elif prefix_ids is not None:
+                key = tuple(prefix_ids)
+                removed = [self._entries.pop(key)] if key in self._entries else []
+            else:
+                removed = []
+                for key, entry in list(self._entries.items()):
+                    if ((target_version is None or entry.get("target_version") == target_version) and
+                            (draft_version is None or entry.get("draft_version") == draft_version)):
+                        removed.append(self._entries.pop(key))
+        del removed
+        gc.collect()
+
+
+prefix_cache = PrefixCache()
+prefix_cache_pool = prefix_cache
 
 
 def shared_prefix_len(tokens_a, tokens_b):
@@ -14,11 +128,14 @@ def shared_prefix_len(tokens_a, tokens_b):
     return length
 
 
-def find_cached_prefix(token_ids):
+def find_cached_prefix(token_ids, target_version=MODEL_CACHE_VERSION,
+                       draft_version=None):
     best = None
-    for cached_ids in prefix_cache_pool:
+    for cached_ids, _ in prefix_cache_pool.items():
         n = len(cached_ids)
-        if len(token_ids) >= n and tuple(token_ids[:n]) == cached_ids:
+        if (len(token_ids) >= n and tuple(token_ids[:n]) == cached_ids and
+                prefix_cache_pool.get(cached_ids, target_version=target_version,
+                                      draft_version=draft_version) is not None):
             if best is None or n > len(best):
                 best = cached_ids
     return best
@@ -31,8 +148,15 @@ def cache_prefix(model, tokenizer, token_ids):
     next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     prefix_cache_pool[tuple(token_ids)] = {
         "kv": out.past_key_values,
-        "first_token": next_token
+        "first_token": next_token,
+        "target_version": MODEL_CACHE_VERSION,
     }
+
+
+def invalidate_prefix_cache(prefix_ids=None, target_version=None, draft_version=None,
+                            clear=False):
+    """Remove one prefix, entries matching versions, or the complete cache."""
+    prefix_cache.invalidate_prefix_cache(prefix_ids, target_version, draft_version, clear)
 
 
 def generate_tokens_with_prefix_ids(model, tokenizer, cached_entry, suffix_ids, max_tokens=20):

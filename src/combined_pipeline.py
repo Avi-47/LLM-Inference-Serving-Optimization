@@ -1,7 +1,14 @@
 import copy
 import torch
 
-from prefix_caching import find_cached_prefix, shared_prefix_len, prefix_cache_pool, MIN_SHARED_PREFIX_LEN
+from prefix_caching import (
+    DRAFT_CACHE_VERSION,
+    MIN_SHARED_PREFIX_LEN,
+    MODEL_CACHE_VERSION,
+    find_cached_prefix,
+    prefix_cache_pool,
+    shared_prefix_len,
+)
 from speculative_decoding import speculative_round
 
 spec_stats = {"rounds": 0, "accepted": 0, "drafted": 0}
@@ -16,7 +23,9 @@ def cache_prefix_both(target_model, draft_model, tokenizer, token_ids):
     prefix_cache_pool[tuple(token_ids)] = {
         "target_kv": target_out.past_key_values,
         "draft_kv": draft_out.past_key_values,
-        "first_token": first_token
+        "first_token": first_token,
+        "target_version": MODEL_CACHE_VERSION,
+        "draft_version": DRAFT_CACHE_VERSION,
     }
 
 
@@ -44,7 +53,11 @@ def combined_generate(target_model, draft_model, tokenizer, prompt, waiting_prom
     matched_prefix = None
 
     if use_prefix_cache:
-        matched_prefix = find_cached_prefix(token_ids)
+        matched_prefix = find_cached_prefix(
+            token_ids,
+            target_version=MODEL_CACHE_VERSION,
+            draft_version=DRAFT_CACHE_VERSION if use_speculative else None,
+        )
         if matched_prefix is None:
             for other_prompt in waiting_prompts:
                 other_ids = tokenizer(other_prompt)["input_ids"]
@@ -56,9 +69,16 @@ def combined_generate(target_model, draft_model, tokenizer, prompt, waiting_prom
 
     if matched_prefix:
         suffix_ids = token_ids[len(matched_prefix):]
-        cached_entry = prefix_cache_pool[matched_prefix]
-        target_kv, draft_kv, last_token = prefill_suffix_both(target_model, draft_model, tokenizer, cached_entry, suffix_ids)
-    else:
+        cached_entry = prefix_cache_pool.get(
+            matched_prefix,
+            target_version=MODEL_CACHE_VERSION,
+            draft_version=DRAFT_CACHE_VERSION if use_speculative else None,
+        )
+        if cached_entry is None:
+            matched_prefix = None
+        else:
+            target_kv, draft_kv, last_token = prefill_suffix_both(target_model, draft_model, tokenizer, cached_entry, suffix_ids)
+    if matched_prefix is None:
         input_ids = torch.tensor([token_ids]).to("cuda")
         with torch.no_grad():
             target_out = target_model(input_ids, use_cache=True)
